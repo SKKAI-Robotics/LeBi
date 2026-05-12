@@ -39,8 +39,10 @@ from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla_twin.configuration_smolvla_twin import SmolVLATwinConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.twinvla.configuration_twinvla import TwinVLAConfig
+from lerobot.policies.twinvla_v2.configuration_twinvla_v2 import TwinVLAV2Config
 from lerobot.policies.utils import validate_visual_features_consistency
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
@@ -120,6 +122,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "smolvla_twin":
+        from lerobot.policies.smolvla_twin.modeling_smolvla_twin import SmolVLATwinPolicy
+
+        return SmolVLATwinPolicy
     elif name == "sarm":
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 
@@ -140,6 +146,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.twinvla.modeling_twinvla import TwinVLAPolicy
 
         return TwinVLAPolicy
+    elif name == "twinvla_v2":
+        from lerobot.policies.twinvla_v2.modeling_twinvla_v2 import TwinVLAV2Policy
+
+        return TwinVLAV2Policy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -416,6 +426,26 @@ def make_pre_post_processors(
         from lerobot.policies.twinvla.processor_twinvla import make_twinvla_pre_post_processors
 
         processors = make_twinvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, TwinVLAV2Config):
+        from lerobot.policies.twinvla_v2.processor_twinvla_v2 import (
+            make_twinvla_v2_pre_post_processors,
+        )
+
+        processors = make_twinvla_v2_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SmolVLATwinConfig):
+        from lerobot.policies.smolvla_twin.processor_smolvla_twin import (
+            make_smolvla_twin_pre_post_processors,
+        )
+
+        processors = make_smolvla_twin_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

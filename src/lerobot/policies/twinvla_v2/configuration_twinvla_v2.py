@@ -25,9 +25,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 DEFAULT_TWINVLA_IMAGE_SIZE = 448
 
 
-@PreTrainedConfig.register_subclass("twinvla")
+@PreTrainedConfig.register_subclass("twinvla_v2")
 @dataclass
-class TwinVLAConfig(PreTrainedConfig):
+class TwinVLAV2Config(PreTrainedConfig):
     # Per-arm action dimensionality (total action = 2 * action_dim)
     action_dim: int = 6
     # Per-arm proprioceptive state dimensionality (total state = 2 * state_dim)

@@ -25,13 +25,13 @@ import torch
 from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.twinvla.configuration_twinvla import TwinVLAConfig
+from lerobot.policies.twinvla_v2.configuration_twinvla_v2 import TwinVLAV2Config
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 logger = logging.getLogger(__name__)
 
 
-def _build_model_args(config: TwinVLAConfig) -> SimpleNamespace:
+def _build_model_args(config: TwinVLAV2Config) -> SimpleNamespace:
     """Translate LeRobot TwinVLAConfig into TwinVLA's model_args namespace."""
     return SimpleNamespace(
         model_type=config.model_type_name,
@@ -82,11 +82,11 @@ def _pad_and_stack(items: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     return collated
 
 
-class TwinVLAPolicy(PreTrainedPolicy):
-    config_class = TwinVLAConfig
-    name = "twinvla"
+class TwinVLAV2Policy(PreTrainedPolicy):
+    config_class = TwinVLAV2Config
+    name = "twinvla_v2"
 
-    def __init__(self, config: TwinVLAConfig, **kwargs):
+    def __init__(self, config: TwinVLAV2Config, **kwargs):
         super().__init__(config)
         self.config = config
         config.validate_features()
