@@ -405,7 +405,43 @@ class SmolVLATwinPolicy(PreTrainedPolicy):
         self.config = config
         config.validate_features()
 
-        self.backbone = SmolVLATwinBackbone(config)
+        # Seed from a SmolVLA base checkpoint when:
+        #   - `smolvla_pretrained_path` is set on the config, AND
+        #   - we are NOT loading a twin-native checkpoint (those already contain
+        #     post-surgery weights and will be loaded by `from_pretrained`).
+        seed_path = config.smolvla_pretrained_path
+        seed_from_smolvla = (
+            seed_path is not None
+            and config.smolvla_twin_pretrained_path is None
+            and config.pretrained_path is None
+        )
+
+        if seed_from_smolvla:
+            # Skip raw SmolVLM2 weight download inside the backbone — SmolVLA's
+            # checkpoint already contains fine-tuned VLM weights and we'll copy
+            # them in below. We restore the original flag afterwards so that
+            # the saved config still reflects user intent.
+            original_load_vlm_weights = config.load_vlm_weights
+            config.load_vlm_weights = False
+            try:
+                self.backbone = SmolVLATwinBackbone(config)
+            finally:
+                config.load_vlm_weights = original_load_vlm_weights
+
+            from lerobot.policies.smolvla.modeling_smolvla import (
+                SmolVLAPolicy as _SmolVLAPolicy,
+            )
+
+            logger.info(
+                "SmolVLATwinPolicy: seeding weights from SmolVLA checkpoint %r",
+                seed_path,
+            )
+            smolvla = _SmolVLAPolicy.from_pretrained(seed_path)
+            self.backbone.load_from_smolvla_policy(smolvla)
+            del smolvla
+        else:
+            self.backbone = SmolVLATwinBackbone(config)
+
         self.reset()
 
     def reset(self):
@@ -558,13 +594,18 @@ class SmolVLATwinPolicy(PreTrainedPolicy):
         lang_emb = vlm_we.embed_language_tokens(lang_tokens)
         lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
 
-        # Per-arm states (project to vlm_hidden)
+        # Per-arm states (project to vlm_hidden). Cast input to the state
+        # projector's weight dtype (may differ from vlm_dtype when
+        # share_state_proj=True keeps the projector at its original fp32),
+        # then cast the projection output back to vlm_dtype for the rest of
+        # the prefix concat.
         state_l, state_r = self._prepare_per_arm_state(batch)
-        state_l = state_l.to(dtype=vlm_dtype)
-        state_r = state_r.to(dtype=vlm_dtype)
-        # Use the per-arm state projectors
-        state_emb_l = self.backbone.state_proj_l(state_l)[:, None, :]
-        state_emb_r = self.backbone.state_proj_r(state_r)[:, None, :]
+        state_proj_l = self.backbone.state_proj_l
+        state_proj_r = self.backbone.state_proj_r
+        state_l = state_l.to(dtype=state_proj_l.weight.dtype)
+        state_r = state_r.to(dtype=state_proj_r.weight.dtype)
+        state_emb_l = state_proj_l(state_l)[:, None, :].to(dtype=vlm_dtype)
+        state_emb_r = state_proj_r(state_r)[:, None, :].to(dtype=vlm_dtype)
 
         B = primary_emb.shape[0]
         device = primary_emb.device

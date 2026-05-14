@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 
+from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor
 from lerobot.policies.smolvla_twin.configuration_smolvla_twin import SmolVLATwinConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -26,6 +27,8 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
+    RenameObservationsProcessorStep,
+    TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
@@ -40,7 +43,15 @@ def make_smolvla_twin_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     input_steps: list[ProcessorStep] = [
+        RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
+        SmolVLANewLineProcessor(),
+        TokenizerProcessorStep(
+            tokenizer_name=config.vlm_model_name,
+            padding=config.pad_language_to,
+            padding_side="right",
+            max_length=config.tokenizer_max_length,
+        ),
         DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
