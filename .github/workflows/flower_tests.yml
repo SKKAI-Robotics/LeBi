@@ -1,0 +1,65 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+
+name: Flower Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/lerobot/policies/flower/**"
+      - "src/lerobot/policies/factory.py"
+      - "src/lerobot/policies/__init__.py"
+      - "tests/policies/flower/**"
+      - "tests/processor/test_flower_processor.py"
+      - "pyproject.toml"
+      - ".github/workflows/flower_tests.yml"
+  push:
+    paths:
+      - "src/lerobot/policies/flower/**"
+      - "src/lerobot/policies/factory.py"
+      - "src/lerobot/policies/__init__.py"
+      - "tests/policies/flower/**"
+      - "tests/processor/test_flower_processor.py"
+      - "pyproject.toml"
+      - ".github/workflows/flower_tests.yml"
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.8.0"
+  PYTHON_VERSION: "3.12"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flower-pytest:
+    name: Flower Pytest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup uv and Python
+        uses: astral-sh/setup-uv@v6 # zizmor: ignore[unpinned-uses]
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test and FLOWER dependencies
+        run: uv sync --extra test --extra flower
+
+      - name: Compile FLOWER modules
+        run: uv run python -m compileall src/lerobot/policies/flower src/lerobot/policies/factory.py
+
+      - name: Run FLOWER tests
+        run: uv run pytest tests/policies/flower tests/processor/test_flower_processor.py -vv
