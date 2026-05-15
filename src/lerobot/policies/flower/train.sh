@@ -1,9 +1,17 @@
-DATASET_ROOT=./datasets/Task1
-PRETRAINED_MODEL=./checkpoints/flower_vla_pret/360000_model_weights.pt
+DATASET_ROOT=../datasets/Task1
+PRETRAINED_MODEL=../checkpoints/flower_vla_pret/360000_model_weights.pt
 EPISODES="$(printf '['; seq -s, 0 249; printf ']')"
+
+# WandB settings
+WANDB_ENABLE=true
+WANDB_PROJECT="flower_train"
+WANDB_ENTITY=""
+WANDB_MODE="online"
+JOB_NAME="test run"
 
 lerobot-train \
   --policy.type=flower \
+  --policy.push_to_hub=false \
   --policy.load_pretrained=true \
   --policy.pretrained_model_path="$PRETRAINED_MODEL" \
   --policy.pretrained_use_ema=true \
@@ -76,4 +84,11 @@ lerobot-train \
   --batch_size=8 \
   --steps=50000 \
   --num_workers=12 \
-  --use_policy_training_preset=true
+  --wandb.enable=$WANDB_ENABLE \
+  --wandb.project="$WANDB_PROJECT" \
+  --wandb.entity="$WANDB_ENTITY" \
+  --wandb.mode=$WANDB_MODE \
+  --job_name="$JOB_NAME" \
+  --use_policy_training_preset=true \
+  --save_checkpoint=true \
+  --save_freq=5000 \

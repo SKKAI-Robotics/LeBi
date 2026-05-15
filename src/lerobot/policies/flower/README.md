@@ -27,8 +27,8 @@ Fine-tune on the first 250 Task1 episodes (`0..249`) from the local LeRobot
 dataset at `./datasets/Task1`:
 
 ```bash
-DATASET_ROOT=./datasets/Task1
-PRETRAINED_MODEL=./checkpoints/flower_vla_pret/360000_model_weights.pt
+DATASET_ROOT=../datasets/Task1
+PRETRAINED_MODEL=../checkpoints/flower_vla_pret/360000_model_weights.pt
 EPISODES="$(printf '['; seq -s, 0 249; printf ']')"
 
 lerobot-train \
@@ -106,6 +106,7 @@ lerobot-train \
   --steps=50000 \
   --num_workers=12 \
   --use_policy_training_preset=true
+  --
 ```
 
 `policy.action_dim=12` follows Task1's `info.json`. The reference CALVIN config
