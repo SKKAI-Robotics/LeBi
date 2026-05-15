@@ -159,7 +159,7 @@ groot = [
 ]
 sarm = ["lerobot[transformers-dep]", "faker>=33.0.0,<35.0.0", "lerobot[matplotlib-dep]", "lerobot[qwen-vl-utils-dep]"]
 xvla = ["lerobot[transformers-dep]"]
-flower = ["lerobot[transformers-dep]", "timm>=1.0.0,<1.1.0"]
+flower = ["lerobot[transformers-dep]", "timm>=1.0.0,<1.1.0", "safetensors>=0.4.3,<1.0.0"]
 hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.13,<0.2.0", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
 
 # Features

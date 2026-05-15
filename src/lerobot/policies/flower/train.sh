@@ -1,32 +1,3 @@
-# FLOWER Policy
-
-`flower` is a LeRobot port of the reference FLOWER VLA model in `reference/flower_vla_calvin`.
-
-The default setup targets the collected local Task1 dataset described by the
-repository-level `info.json` and `stats.json` files:
-
-- `observation.images.left_left`
-- `observation.images.left_top`
-- `observation.images.right_right`
-- `action` with dimension 12
-
-The model always builds action heads for 7D, 12D, and 16D action spaces. With
-`action_space="auto"`, the active head is selected from the dataset action
-dimension during training or from `default_action_space` during action selection.
-
-Reference FLOWER checkpoints are loaded through `policy.pretrained_model_path`.
-The default raw checkpoint path is:
-
-- `./checkpoints/flower_vla_pret/360000_model_weights.pt`
-
-The LeRobot `pretrained_path` field is still reserved for LeRobot-format policy
-checkpoints containing `config.json` and model weights. Raw FLOWER
-`.pt`/`.safetensors` weights should use `policy.pretrained_model_path`.
-
-Fine-tune on the first 250 Task1 episodes (`0..249`) from the local LeRobot
-dataset at `./datasets/Task1`:
-
-```bash
 DATASET_ROOT=./datasets/Task1
 PRETRAINED_MODEL=./checkpoints/flower_vla_pret/360000_model_weights.pt
 EPISODES="$(printf '['; seq -s, 0 249; printf ']')"
@@ -106,7 +77,3 @@ lerobot-train \
   --steps=50000 \
   --num_workers=12 \
   --use_policy_training_preset=true
-```
-
-`policy.action_dim=12` follows Task1's `info.json`. The reference CALVIN config
-uses `action_dim=7`, but using 7D here would not match the 12D Task1 actions.

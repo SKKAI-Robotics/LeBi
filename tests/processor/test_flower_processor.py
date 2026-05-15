@@ -9,9 +9,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 
 CAMERA_KEYS = (
-    f"{OBS_IMAGES}.left_wrist_cam",
-    f"{OBS_IMAGES}.right_wrist_cam",
-    f"{OBS_IMAGES}.top_view",
+    f"{OBS_IMAGES}.left_left",
+    f"{OBS_IMAGES}.left_top",
+    f"{OBS_IMAGES}.right_right",
 )
 
 
@@ -23,6 +23,7 @@ def make_config() -> FlowerConfig:
         image_size=16,
         chunk_size=3,
         n_action_steps=2,
+        load_pretrained=False,
     )
 
 

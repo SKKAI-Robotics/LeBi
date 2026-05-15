@@ -19,8 +19,59 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+
+
+@LRSchedulerConfig.register_subclass("flower_tri_stage")
+@dataclass
+class FlowerTriStageSchedulerConfig(LRSchedulerConfig):
+    """Tri-stage scheduler used by the reference FLOWER config.
+
+    Warm up from `lr * init_lr_scale` to `lr`, hold, then cosine-decay to
+    `lr * final_lr_scale`. The phase ratios mirror
+    `reference/flower_vla_calvin/conf/model/flower.yaml`.
+    """
+
+    num_warmup_steps: int | None = None
+    lr: float = 2e-5
+    init_lr_scale: float = 0.1
+    final_lr_scale: float = 0.5
+    total_steps: int = 50_000
+    phase_ratio: tuple[float, float, float] = (0.05, 0.1, 0.85)
+
+    def build(self, optimizer, num_training_steps: int):
+        import math
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        total_steps = self.total_steps or num_training_steps
+        warmup_steps = int(total_steps * self.phase_ratio[0])
+        hold_steps = int(total_steps * self.phase_ratio[1])
+        decay_steps = max(1, int(total_steps * self.phase_ratio[2]))
+        init_scale = self.init_lr_scale
+        final_scale = self.final_lr_scale
+
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                if warmup_steps == 0:
+                    return 1.0
+                return init_scale + (1.0 - init_scale) * current_step / warmup_steps
+
+            offset = warmup_steps
+            if current_step < offset + hold_steps:
+                return 1.0
+
+            offset += hold_steps
+            if current_step <= offset + decay_steps:
+                decay_step = current_step - offset
+                return final_scale + 0.5 * (1.0 - final_scale) * (
+                    1.0 + math.cos(decay_step / decay_steps * math.pi)
+                )
+
+            return final_scale
+
+        return LambdaLR(optimizer, lr_lambda)
 
 
 @PreTrainedConfig.register_subclass("flower")
@@ -28,9 +79,10 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 class FlowerConfig(PreTrainedConfig):
     """FLOWER VLA policy configuration for LeRobot.
 
-    The default contract targets the Task1 dual-arm dataset:
-    three RGB cameras and 12D action chunks. The action registry also creates
-    7D and 16D heads so later fine-tuning can reuse the same checkpoint format.
+    The default contract targets the local Task1 dual-arm dataset described by
+    the repository-level info.json/stats.json files: three RGB cameras and 12D
+    action chunks. The action registry also creates 7D and 16D heads so later
+    fine-tuning can reuse the same checkpoint format.
     """
 
     n_obs_steps: int = 1
@@ -38,10 +90,11 @@ class FlowerConfig(PreTrainedConfig):
     n_action_steps: int = 10
 
     camera_keys: tuple[str, ...] = (
-        f"{OBS_IMAGES}.left_wrist_cam",
-        f"{OBS_IMAGES}.right_wrist_cam",
-        f"{OBS_IMAGES}.top_view",
+        f"{OBS_IMAGES}.left_left",
+        f"{OBS_IMAGES}.left_top",
+        f"{OBS_IMAGES}.right_right",
     )
+    top_camera_keys: tuple[str, ...] = (f"{OBS_IMAGES}.left_top",)
 
     action_space: str = "auto"
     default_action_space: str = "bimanual_12d"
@@ -65,11 +118,27 @@ class FlowerConfig(PreTrainedConfig):
     vlm_path: str = "microsoft/Florence-2-large"
     trust_remote_code: bool = True
     freeze_florence: bool = False
-    freeze_vision_tower: bool = True
+    freeze_vision_tower: bool = False
+    vlm_prompt_style: str = "default"
     tokenizer_max_length: int = 64
     num_prompt_tokens: int = 1
     token_dropout: float = 0.1
     default_task: str | None = None
+
+    # Reference FLOWER compatibility knobs. `chunk_size`/`n_action_steps` are the
+    # LeRobot-native names for `act_window_size`/action chunking.
+    multistep: int | None = None
+    lowdim_obs_dim: int = 7
+    action_dim: int | None = 12
+    act_window_size: int | None = None
+
+    # Raw reference FLOWER checkpoint loading. Keep this separate from the
+    # inherited `pretrained_path`, which is reserved for LeRobot checkpoints
+    # containing `config.json` and `model.safetensors`.
+    load_pretrained: bool = True
+    pretrained_model_path: str | None = "./checkpoints/flower_vla_pret/360000_model_weights.pt"
+    pretrained_use_ema: bool = True
+    pretrained_ignore_mismatched_sizes: bool = True
 
     # Image preprocessing.
     image_size: int = 224
@@ -77,6 +146,9 @@ class FlowerConfig(PreTrainedConfig):
     image_std: tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711)
     normalize_images: bool = True
     validate_image_range: bool = True
+    random_shift_aug: bool = True
+    random_shift_top_pad: int = 10
+    random_shift_wrist_pad: int = 4
 
     # FLOWER/DiT head.
     dit_dim: int = 1024
@@ -85,17 +157,32 @@ class FlowerConfig(PreTrainedConfig):
     mlp_ratio: float = 4.0
     attn_pdrop: float = 0.1
     resid_pdrop: float = 0.1
+    mlp_pdrop: float = 0.1
     norm_eps: float = 1e-6
     timestep_embed_dim: int = 256
     frequency_embed_dim: int = 256
     num_sampling_steps: int = 4
     sampling_type: str = "uniform"
     use_cross_attn: bool = True
+    use_second_view: bool = True
+    second_view_key: str = "image_wrist"
+    action_type_adaln: bool = True
+    use_causal_attention: bool = True
+    use_adaln_cond: bool = False
+    use_readout_token: bool = False
     use_proprio: bool = False
     proprio_dim: int | None = None
+    return_act_chunk: bool = False
     action_clip_value: float | None = 1.0
 
+    # Reference FLOWER positional-attention knobs.
+    use_rope: bool = True
+    use_nope: bool = False
+    query_seq_len: int = 100
+    rope_theta: float = 32.0
+
     # Training presets.
+    optimizer_type: str = "adamw"
     optimizer_lr: float = 2e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
@@ -105,8 +192,18 @@ class FlowerConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 100_000
     scheduler_decay_lr: float = 2e-6
+    scheduler_init_lr_scale: float = 0.1
+    scheduler_final_lr_scale: float = 0.5
+    scheduler_total_steps: int = 50_000
+    scheduler_phase_ratio: tuple[float, float, float] = (0.05, 0.1, 0.85)
 
     def __post_init__(self) -> None:
+        if self.act_window_size is not None:
+            self.chunk_size = self.act_window_size
+        if self.multistep is not None:
+            self.n_action_steps = self.multistep
+        if self.action_dim is not None:
+            self.action_space_name_from_dim(self.action_dim)
         super().__post_init__()
         if self.n_obs_steps != 1:
             raise ValueError("FLOWER currently expects `n_obs_steps=1`.")
@@ -118,8 +215,16 @@ class FlowerConfig(PreTrainedConfig):
             raise ValueError(
                 f"`n_action_steps` ({self.n_action_steps}) must be <= `chunk_size` ({self.chunk_size})."
             )
+        if self.random_shift_top_pad < 0 or self.random_shift_wrist_pad < 0:
+            raise ValueError("FLOWER random shift padding values must be non-negative.")
         if self.dit_dim % self.n_heads != 0:
             raise ValueError(f"`dit_dim` ({self.dit_dim}) must be divisible by `n_heads` ({self.n_heads}).")
+        if self.use_rope and (self.dit_dim // self.n_heads) % 2 != 0:
+            raise ValueError("FLOWER RoPE requires an even attention head dimension.")
+        if self.use_rope and self.query_seq_len < self.chunk_size:
+            raise ValueError(
+                f"`query_seq_len` ({self.query_seq_len}) must be >= `chunk_size` ({self.chunk_size}) when RoPE is enabled."
+            )
         if self.action_space != "auto" and self.action_space not in self.supported_action_spaces:
             raise ValueError(
                 f"Unsupported `action_space={self.action_space}`. "
@@ -130,10 +235,21 @@ class FlowerConfig(PreTrainedConfig):
                 f"`default_action_space={self.default_action_space}` is not in "
                 f"{sorted(self.supported_action_spaces)}."
             )
-        if self.sampling_type not in {"uniform", "logit_normal", "pi_zero"}:
+        if self.use_rope and self.use_nope:
+            self.use_nope = False
+        self.use_readout_token = self.use_readout_token and self.use_adaln_cond
+        if self.sampling_type not in {"uniform", "logit_normal", "ln", "pi_zero"}:
             raise ValueError(
-                f"`sampling_type` must be one of 'uniform', 'logit_normal', or 'pi_zero', got {self.sampling_type}."
+                "`sampling_type` must be one of 'uniform', 'logit_normal'/'ln', or "
+                f"'pi_zero', got {self.sampling_type}."
             )
+        if self.vlm_prompt_style not in {"default", "minimal", "combined", "visual", "structured"}:
+            raise ValueError(
+                "`vlm_prompt_style` must be one of 'default', 'minimal', 'combined', 'visual', or "
+                f"'structured', got {self.vlm_prompt_style}."
+            )
+        if self.optimizer_type != "adamw":
+            raise ValueError(f"FLOWER currently supports `optimizer_type='adamw'`, got {self.optimizer_type}.")
 
     def validate_features(self) -> None:
         if self.input_features is None:
@@ -142,9 +258,10 @@ class FlowerConfig(PreTrainedConfig):
             self.output_features = {}
 
         if ACTION not in self.output_features:
+            action_dim = self.action_dim or self.supported_action_spaces[self.default_action_space]
             self.output_features[ACTION] = PolicyFeature(
                 type=FeatureType.ACTION,
-                shape=(self.supported_action_spaces[self.default_action_space],),
+                shape=(action_dim,),
             )
 
         image_features = self.image_features
@@ -231,13 +348,24 @@ class FlowerConfig(PreTrainedConfig):
             grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
-    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
-        return CosineDecayWithWarmupSchedulerConfig(
-            peak_lr=self.optimizer_lr,
-            decay_lr=self.scheduler_decay_lr,
-            num_warmup_steps=self.scheduler_warmup_steps,
-            num_decay_steps=self.scheduler_decay_steps,
+    def get_scheduler_preset(self) -> FlowerTriStageSchedulerConfig:
+        return FlowerTriStageSchedulerConfig(
+            lr=self.optimizer_lr,
+            init_lr_scale=self.scheduler_init_lr_scale,
+            final_lr_scale=self.scheduler_final_lr_scale,
+            total_steps=self.scheduler_total_steps,
+            phase_ratio=self.scheduler_phase_ratio,
         )
+
+    def _save_pretrained(self, save_directory) -> None:
+        # Raw FLOWER weights are an initialization source, not a dependency of a
+        # saved LeRobot policy checkpoint.
+        original_load_pretrained = self.load_pretrained
+        self.load_pretrained = False
+        try:
+            super()._save_pretrained(save_directory)
+        finally:
+            self.load_pretrained = original_load_pretrained
 
     @property
     def observation_delta_indices(self) -> list[int]:

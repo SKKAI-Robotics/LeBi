@@ -44,16 +44,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Setup uv and Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup uv
         uses: astral-sh/setup-uv@v6 # zizmor: ignore[unpinned-uses]
         with:
           enable-cache: true
           version: ${{ env.UV_VERSION }}
-          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install test and FLOWER dependencies
         run: uv sync --extra test --extra flower

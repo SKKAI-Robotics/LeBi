@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,32 +17,60 @@ from torch import Tensor, nn
 
 from lerobot.policies.flower.configuration_flower import FlowerConfig
 from lerobot.policies.flower.modeling_flower_blocks import (
+    ActionMlp,
     FlowBlock,
     FreqEmbedder,
     RMSNorm,
     SharedAdaLNController,
     TimestepEmbedder,
-    build_sincos_position_embedding,
+    ZeroEncoder,
+    stateless_norm,
 )
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import _transformers_available
 
+logger = logging.getLogger(__name__)
 
-def generate_policy_prompt(task: str, action_space_name: str) -> str:
+
+def generate_policy_prompt(task: str, action_space_name: str, prompt_style: str = "default") -> str:
     if action_space_name == "single_arm_7d":
-        action_desc = "single-arm 7D end-effector delta action"
-        arm_desc = "one robot arm"
+        robot_name = "Franka Panda"
+        action_desc = "Delta End-Effector"
+        arm_count = 1
     elif action_space_name == "bimanual_16d":
-        action_desc = "dual-arm 16D action"
-        arm_desc = "two robot arms"
+        robot_name = "Dual Arm Robot"
+        action_desc = "16D Bimanual Action"
+        arm_count = 2
     else:
-        action_desc = "dual-arm 12D action"
-        arm_desc = "two robot arms"
+        robot_name = "Dual Arm Robot"
+        action_desc = "12D Bimanual Action"
+        arm_count = 2
 
+    meta = f"Agent Type: {arm_count}-arm {robot_name}, Action Space: {action_desc}, "
+    if prompt_style == "combined":
+        return (
+            f"{meta}. </od>Task Instruction: {task}</od>"
+            "<grounding>identify objects and spatial relationships for robotic manipulation</grounding>"
+        )
+    if prompt_style == "visual":
+        return (
+            f"<od>Task Instruction: {task}</od> "
+            "<grounding>identify key objects and their spatial relationships</grounding> "
+            "<region_cap>analyze motion paths and collision-free trajectories</region_cap> "
+            f"<cap>{meta}</cap>"
+        )
+    if prompt_style == "structured":
+        return (
+            f"<od>ROBOT CONFIGURATION: {meta}. TASK OBJECTIVE: {task}. "
+            "ANALYSIS REQUIREMENTS: identify target objects and obstacles; "
+            "determine spatial relationships; plan manipulation sequence.</od>"
+        )
+    if prompt_style in {"minimal", "default"}:
+        return f"{meta}. Task Instruction: {task}"
     return (
         "You are controlling a robot policy. "
-        f"The robot has {arm_desc}. "
+        f"The robot has {arm_count} arm(s). "
         f"Predict the next {action_desc} chunk for the instruction: {task}"
     )
 
@@ -87,38 +117,58 @@ class FlowerModel(nn.Module):
         )
 
         self._setup_vlm(config.vlm_path, config.freeze_vision_tower, config.freeze_florence)
-        self.vlm_to_dit = nn.Linear(self.vlm_hidden_dim, config.dit_dim)
+        self.cond_linear = nn.Linear(self.vlm_hidden_dim, config.dit_dim, bias=False)
         self.t_embedder = TimestepEmbedder(config.dit_dim, config.timestep_embed_dim)
         self.frequency_embedder = FreqEmbedder(config.dit_dim, config.frequency_embed_dim)
-        self.cond_norm = RMSNorm(config.dit_dim, eps=config.norm_eps)
+        self.cond_norm = RMSNorm(self.vlm_hidden_dim, eps=config.norm_eps)
 
         self.action_encoders = nn.ModuleDict(
-            {name: nn.Linear(dim, config.dit_dim) for name, dim in config.supported_action_spaces.items()}
+            {
+                name: ActionMlp(in_features=dim, hidden_features=config.dit_dim, out_features=config.dit_dim)
+                for name, dim in config.supported_action_spaces.items()
+            }
         )
         self.action_decoders = nn.ModuleDict(
             {name: nn.Linear(config.dit_dim, dim) for name, dim in config.supported_action_spaces.items()}
         )
-        for decoder in self.action_decoders.values():
-            nn.init.zeros_(decoder.weight)
-            nn.init.zeros_(decoder.bias)
 
-        self.action_adaln = nn.ModuleDict(
-            {
-                name: SharedAdaLNController(
-                    cond_dim=config.dit_dim,
-                    hidden_size=config.dit_dim,
-                    n_layers=config.n_layers,
-                    n_action_spaces=len(config.supported_action_spaces),
-                )
-                for name in config.supported_action_spaces
-            }
-        )
+        if config.action_type_adaln:
+            self.action_adaln = nn.ModuleDict(
+                {
+                    name: SharedAdaLNController(
+                        dim=config.dit_dim,
+                        global_conddim=config.dit_dim,
+                        use_cross_attn=config.use_cross_attn,
+                    )
+                    for name in config.supported_action_spaces
+                }
+            )
+            self.global_adaln = None
+        else:
+            self.action_adaln = None
+            self.global_adaln = SharedAdaLNController(
+                dim=config.dit_dim,
+                global_conddim=config.dit_dim,
+                use_cross_attn=config.use_cross_attn,
+            )
 
         if config.use_proprio:
             if config.state_dim <= 0:
                 raise ValueError("`use_proprio=True` requires a positive state dimension.")
             self.proprio_encoders = nn.ModuleDict(
-                {name: nn.Linear(config.state_dim, config.dit_dim) for name in config.supported_action_spaces}
+                {
+                    name: (
+                        ActionMlp(
+                            in_features=config.state_dim,
+                            hidden_features=config.dit_dim,
+                            out_features=config.dit_dim,
+                            drop=0.2,
+                        )
+                        if name == "bimanual_16d"
+                        else ZeroEncoder(config.dit_dim)
+                    )
+                    for name in config.supported_action_spaces
+                }
             )
         else:
             self.proprio_encoders = None
@@ -126,23 +176,141 @@ class FlowerModel(nn.Module):
         self.dit = nn.ModuleList(
             [
                 FlowBlock(
-                    hidden_size=config.dit_dim,
-                    n_heads=config.n_heads,
-                    mlp_ratio=config.mlp_ratio,
+                    dim=config.dit_dim,
+                    heads=config.n_heads,
                     attn_pdrop=config.attn_pdrop,
                     resid_pdrop=config.resid_pdrop,
-                    norm_eps=config.norm_eps,
+                    mlp_pdrop=config.mlp_pdrop,
                     use_cross_attn=config.use_cross_attn,
+                    use_rope=config.use_rope and not config.use_nope,
+                    query_seq_len=config.query_seq_len,
+                    rope_theta=config.rope_theta,
+                    norm_eps=config.norm_eps,
                 )
                 for _ in range(config.n_layers)
             ]
         )
-        self.final_norm = RMSNorm(config.dit_dim, eps=config.norm_eps)
-        self.register_buffer(
-            "action_pos_embed",
-            build_sincos_position_embedding(config.chunk_size, config.dit_dim),
-            persistent=False,
+        if not config.use_rope and not config.use_nope:
+            self.positional_encoding = nn.Parameter(torch.randn(1, config.chunk_size, config.dit_dim) * 0.1)
+        else:
+            self.register_buffer(
+                "positional_encoding", torch.zeros(1, config.chunk_size, config.dit_dim), persistent=False
+            )
+        if config.load_pretrained and config.pretrained_model_path is not None:
+            self.load_pretrained_weights(
+                config.pretrained_model_path,
+                use_ema=config.pretrained_use_ema,
+                ignore_mismatched_sizes=config.pretrained_ignore_mismatched_sizes,
+            )
+
+    def load_pretrained_weights(
+        self,
+        pretrained_model_path: str,
+        *,
+        use_ema: bool = True,
+        ignore_mismatched_sizes: bool = True,
+    ) -> dict[str, Any]:
+        path = Path(pretrained_model_path)
+        logger.info("Loading raw FLOWER pretrained weights from %s", path)
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            checkpoint: dict[str, Any] = {"state_dict": load_file(str(path), device=str(self.prompt_embeds.device))}
+        else:
+            try:
+                checkpoint = torch.load(path, map_location=self.prompt_embeds.device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(path, map_location=self.prompt_embeds.device)
+
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        if use_ema:
+            state_dict = self._maybe_extract_ema_state_dict(checkpoint, state_dict)
+
+        remapped = self._remap_reference_state_dict_keys(state_dict)
+        target_state = self.state_dict()
+        loadable: dict[str, Tensor] = {}
+        skipped_mismatched: list[str] = []
+        unexpected: list[str] = []
+        for key, value in remapped.items():
+            if key not in target_state:
+                unexpected.append(key)
+                continue
+            if tuple(target_state[key].shape) != tuple(value.shape):
+                if ignore_mismatched_sizes:
+                    skipped_mismatched.append(key)
+                    continue
+                raise ValueError(
+                    f"Shape mismatch while loading FLOWER checkpoint key '{key}': "
+                    f"checkpoint {tuple(value.shape)} vs model {tuple(target_state[key].shape)}."
+                )
+            loadable[key] = value
+
+        missing, incompatible_unexpected = self.load_state_dict(loadable, strict=False)
+        report = {
+            "loaded": len(loadable),
+            "missing": list(missing),
+            "unexpected": unexpected + list(incompatible_unexpected),
+            "skipped_mismatched": skipped_mismatched,
+        }
+        logger.info(
+            "Raw FLOWER checkpoint load report: loaded=%s missing=%s unexpected=%s skipped_mismatched=%s",
+            report["loaded"],
+            len(report["missing"]),
+            len(report["unexpected"]),
+            len(report["skipped_mismatched"]),
         )
+        return report
+
+    def _maybe_extract_ema_state_dict(
+        self, checkpoint: dict[str, Any], fallback_state_dict: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        callbacks = checkpoint.get("callbacks")
+        if not isinstance(callbacks, dict):
+            return fallback_state_dict
+        ema_block = callbacks.get("EMA")
+        if not isinstance(ema_block, dict) or "ema_weights" not in ema_block:
+            return fallback_state_dict
+
+        ema_weights = ema_block["ema_weights"]
+        if not isinstance(ema_weights, list):
+            return fallback_state_dict
+
+        ema_state_dict: dict[str, Tensor] = {}
+        ema_idx = 0
+        for name, tensor in fallback_state_dict.items():
+            if ema_idx >= len(ema_weights):
+                ema_state_dict[name] = tensor
+                continue
+            ema_tensor = ema_weights[ema_idx]
+            if hasattr(ema_tensor, "shape") and tuple(ema_tensor.shape) == tuple(tensor.shape):
+                ema_state_dict[name] = ema_tensor
+                ema_idx += 1
+            else:
+                ema_state_dict[name] = tensor
+        return ema_state_dict
+
+    def _remap_reference_state_dict_keys(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        action_name_remap = {
+            "eef_delta": "single_arm_7d",
+            "bimanual_nav": "bimanual_16d",
+        }
+        remapped: dict[str, Tensor] = {}
+        for key, value in state_dict.items():
+            new_key = key.removeprefix("agent.").removeprefix("model.")
+            new_key = new_key.replace("vlm.language_encoder.", "vlm.language_model.model.encoder.")
+            new_key = new_key.replace(".mlp.c_fc1.", ".mlp.fc1.")
+            new_key = new_key.replace(".mlp.c_fc2.", ".mlp.fc2.")
+            new_key = new_key.replace(".mlp.c_proj.", ".mlp.proj.")
+            new_key = new_key.replace("action_pos_embed", "positional_encoding")
+            if new_key.startswith("adaln."):
+                new_key = f"action_{new_key}"
+            for old_name, new_name in action_name_remap.items():
+                new_key = new_key.replace(f"action_encoders.{old_name}.", f"action_encoders.{new_name}.")
+                new_key = new_key.replace(f"action_decoders.{old_name}.", f"action_decoders.{new_name}.")
+                new_key = new_key.replace(f"proprio_encoders.{old_name}.", f"proprio_encoders.{new_name}.")
+                new_key = new_key.replace(f"action_adaln.{old_name}.", f"action_adaln.{new_name}.")
+            remapped[new_key] = value
+        return remapped
 
     def _setup_vlm(self, vlm_path: str, freeze_vision_tower: bool, freeze_florence: bool) -> None:
         if not _transformers_available:
@@ -164,7 +332,9 @@ class FlowerModel(nn.Module):
         self.tokenizer = self.processor.tokenizer
         self.vlm_hidden_dim = self._infer_vlm_hidden_dim()
 
-        if hasattr(self.tokenizer, "add_tokens"):
+        if hasattr(self.tokenizer, "add_special_tokens"):
+            self.tokenizer.add_special_tokens({"additional_special_tokens": ["<Flow>"]})
+        elif hasattr(self.tokenizer, "add_tokens"):
             self.tokenizer.add_tokens(["<Flow>"])
         if hasattr(self.vlm, "resize_token_embeddings") and hasattr(self.tokenizer, "__len__"):
             self.vlm.resize_token_embeddings(len(self.tokenizer))
@@ -179,8 +349,17 @@ class FlowerModel(nn.Module):
                     prompt_embed = prompt_embed.repeat(1, self.config.num_prompt_tokens, 1)
             except Exception:
                 pass
-        self.prompt_embeds = nn.Parameter(prompt_embed)
+        self.prompt_embeds = nn.Parameter(prompt_embed, requires_grad=False)
         self.vlm_token_dropout = nn.Dropout(self.config.token_dropout)
+
+        try:
+            del self.vlm.language_model.model.decoder
+        except AttributeError:
+            pass
+        try:
+            del self.vlm.language_model.lm_head
+        except AttributeError:
+            pass
 
         if freeze_florence:
             for param in self.vlm.parameters():
@@ -214,42 +393,35 @@ class FlowerModel(nn.Module):
 
         bsz = vlm_image_features.shape[0]
         prompts = [
-            generate_policy_prompt(task, action_space_name)
+            generate_policy_prompt(task, action_space_name, self.config.vlm_prompt_style)
             for task in self._get_task_list(batch, batch_size=bsz)
         ]
-        text_embeds, text_attention_mask = self._get_text_embeddings(prompts)
+        text_embeds, _ = self._get_text_embeddings(prompts)
         prompt_embeds = self.prompt_embeds.to(device=vlm_image_features.device, dtype=vlm_image_features.dtype)
         prompt_embeds = prompt_embeds.expand(bsz, -1, -1)
 
         encoder_inputs = torch.cat([vlm_image_features, prompt_embeds, text_embeds], dim=1)
-        image_prompt_mask = torch.ones(
-            bsz,
-            vlm_image_features.shape[1] + prompt_embeds.shape[1],
-            dtype=text_attention_mask.dtype,
-            device=text_attention_mask.device,
-        )
-        attention_mask = torch.cat([image_prompt_mask, text_attention_mask], dim=1)
+        attention_mask = torch.ones(encoder_inputs.shape[:2], dtype=torch.long, device=encoder_inputs.device)
         encoder_outputs = self._run_vlm_encoder(encoder_inputs, attention_mask)
-        vlm_features = self.vlm_to_dit(self.vlm_token_dropout(encoder_outputs))
-        vlm_features = self.cond_norm(vlm_features)
+        features = self.vlm_token_dropout(encoder_outputs)
 
         frequency = torch.full(
             (bsz, 1, 1),
             3.0,
-            dtype=vlm_features.dtype,
-            device=vlm_features.device,
+            dtype=features.dtype,
+            device=features.device,
         )
         action_type = torch.full(
             (bsz,),
             self.action_registry.index(action_space_name),
             dtype=torch.long,
-            device=vlm_features.device,
+            device=features.device,
         )
 
         cond = {
-            "vlm_features": vlm_features,
-            "vlm_attention_mask": attention_mask.to(device=vlm_features.device, dtype=torch.bool),
-            "frequency": self.frequency_embedder(frequency),
+            "features": features,
+            "attention_mask": attention_mask.to(device=features.device, dtype=torch.bool),
+            "frequency_embeds": self.frequency_embedder(frequency),
             "action_type": action_type,
         }
         if self.config.use_proprio:
@@ -258,7 +430,7 @@ class FlowerModel(nn.Module):
             state = batch[OBS_STATE]
             if state.ndim == 3:
                 state = state[:, -1]
-            cond["proprio"] = state.to(device=vlm_features.device, dtype=vlm_features.dtype)
+            cond["proprio"] = state.to(device=features.device, dtype=features.dtype)
         return cond
 
     def _prepare_images(self, batch: dict[str, Any]) -> list[Tensor]:
@@ -287,9 +459,43 @@ class FlowerModel(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
+            if self.training and self.config.random_shift_aug:
+                pad = (
+                    self.config.random_shift_top_pad
+                    if key in self.config.top_camera_keys or key.endswith("top_view")
+                    else self.config.random_shift_wrist_pad
+                )
+                image = self._random_shift_images(image, pad)
             image = image.reshape(bsz, timesteps, channels, self.config.image_size, self.config.image_size)
             images.append(image)
         return images
+
+    def _random_shift_images(self, images: Tensor, pad: int) -> Tensor:
+        if pad <= 0:
+            return images
+        _, _, height, width = images.shape
+        if height != width:
+            return images
+        padded = F.pad(images, (pad, pad, pad, pad), mode="replicate")
+        eps = 1.0 / (height + 2 * pad)
+        arange = torch.linspace(
+            -1.0 + eps,
+            1.0 - eps,
+            height + 2 * pad,
+            device=images.device,
+            dtype=images.dtype,
+        )[:height]
+        arange = arange.unsqueeze(0).repeat(height, 1).unsqueeze(2)
+        base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
+        base_grid = base_grid.unsqueeze(0).repeat(images.shape[0], 1, 1, 1)
+        shift = torch.randint(
+            0,
+            2 * pad + 1,
+            size=(images.shape[0], 1, 1, 2),
+            device=images.device,
+        ).to(dtype=images.dtype)
+        shift *= 2.0 / (height + 2 * pad)
+        return F.grid_sample(padded, base_grid + shift, padding_mode="zeros", align_corners=False)
 
     def _encode_image_view(self, image: Tensor) -> Tensor:
         bsz, timesteps = image.shape[:2]
@@ -353,21 +559,51 @@ class FlowerModel(nn.Module):
         return output.last_hidden_state if hasattr(output, "last_hidden_state") else output[0]
 
     def dit_forward(self, z: Tensor, t: Tensor, cond: dict[str, Tensor], action_space_name: str) -> Tensor:
+        default_dtype = next(self.parameters()).dtype
         bsz, seq_len, _ = z.shape
+        z = z.to(dtype=default_dtype)
+        features = cond["features"].to(dtype=default_dtype)
+        frequency_embeds = cond["frequency_embeds"].to(dtype=default_dtype)
+        while frequency_embeds.ndim > 2:
+            frequency_embeds = frequency_embeds.squeeze(1)
+
         x = self.action_encoders[action_space_name](z)
-        time_embed = self.t_embedder(t.reshape(bsz, -1)[:, 0]).unsqueeze(1)
-        x = x + time_embed + self.action_pos_embed[:, :seq_len].to(device=x.device, dtype=x.dtype)
+        if not self.config.use_rope and not self.config.use_nope:
+            x = x + self.positional_encoding[:, :seq_len].to(device=x.device, dtype=x.dtype)
 
-        context = cond["vlm_features"]
-        cond_summary = context.mean(dim=1) + cond["frequency"]
+        t_emb = self.t_embedder(t.reshape(bsz, -1)[:, 0])
+        proprio_embeds = torch.zeros_like(frequency_embeds)
         if self.proprio_encoders is not None and "proprio" in cond:
-            cond_summary = cond_summary + self.proprio_encoders[action_space_name](cond["proprio"])
+            proprio = cond["proprio"].to(dtype=default_dtype)
+            proprio_embeds = self.proprio_encoders[action_space_name](proprio)
 
-        adaln = self.action_adaln[action_space_name](cond_summary, cond["action_type"])
-        context_mask = cond.get("vlm_attention_mask")
-        for idx, block in enumerate(self.dit):
-            x = block(x, adaln[:, idx], context=context, context_mask=context_mask)
-        x = self.final_norm(x)
+        global_cond = (
+            stateless_norm(t_emb)
+            + stateless_norm(frequency_embeds)
+            + stateless_norm(proprio_embeds)
+        )
+
+        context = self.cond_linear(self.cond_norm(features))
+        if self.config.use_adaln_cond:
+            vlm_token = context[:, 0] if self.config.use_readout_token else context.mean(dim=1)
+            global_cond = global_cond + vlm_token
+
+        if self.config.action_type_adaln:
+            global_adaln = self.action_adaln[action_space_name](global_cond)
+        else:
+            global_adaln = self.global_adaln(global_cond)
+
+        context_mask = cond.get("attention_mask")
+        context = context if self.config.use_cross_attn else None
+        for block in self.dit:
+            x = block(
+                x,
+                global_cond,
+                context=context,
+                custom_cross_attn_mask=context_mask,
+                is_causal=self.config.use_causal_attention,
+                global_adaln=global_adaln,
+            )
         return self.action_decoders[action_space_name](x)
 
     def rf_loss(
@@ -384,8 +620,8 @@ class FlowerModel(nn.Module):
         actions = actions[:, : self.config.chunk_size]
         noise = torch.randn_like(actions)
         t = self._sample_timestep(actions.shape[0], actions.device, actions.dtype)
-        zt = (1 - t) * noise + t * actions
-        target = actions - noise
+        zt = (1 - t) * actions + t * noise
+        target = noise - actions
         pred = self.dit_forward(zt, t, cond, action_space_name)
         loss = (pred - target).pow(2).mean(dim=-1)
 
@@ -403,13 +639,15 @@ class FlowerModel(nn.Module):
         return loss, {"loss": float(loss.detach().cpu())}
 
     def _sample_timestep(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        if self.config.sampling_type == "logit_normal":
+        if self.config.sampling_type in {"logit_normal", "ln"}:
             t = torch.sigmoid(torch.randn(batch_size, 1, 1, device=device, dtype=dtype))
         elif self.config.sampling_type == "pi_zero":
             t = torch.distributions.Beta(1.5, 1.0).sample((batch_size, 1, 1)).to(device=device, dtype=dtype)
         else:
-            t = torch.rand(batch_size, 1, 1, device=device, dtype=dtype)
-        return t
+            eps = 1e-5
+            t = (torch.rand(1, device=device, dtype=dtype) + torch.arange(batch_size, device=device, dtype=dtype) / batch_size) % (1 - eps)
+            t = t.view(batch_size, 1, 1)
+        return t.clamp(max=0.999)
 
     @torch.no_grad()
     def sample_actions(
@@ -420,11 +658,11 @@ class FlowerModel(nn.Module):
     ) -> Tensor:
         z = noise
         num_steps = self.config.num_sampling_steps
-        for step in range(num_steps):
+        for step in range(num_steps, 0, -1):
             t_value = step / num_steps
             t = torch.full((z.shape[0], 1, 1), t_value, dtype=z.dtype, device=z.device)
             velocity = self.dit_forward(z, t, cond, action_space_name)
-            z = z + velocity / num_steps
+            z = z - velocity / num_steps
         if self.config.action_clip_value is not None:
             z = z.clamp(-self.config.action_clip_value, self.config.action_clip_value)
         return z
@@ -443,7 +681,20 @@ class FlowerPolicy(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self):
-        return [param for param in self.parameters() if param.requires_grad]
+        no_decay = ("bias", "layernorm", "layer_norm", "ln", "norm")
+        decay_group = []
+        no_decay_group = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name.lower() for token in no_decay):
+                no_decay_group.append(param)
+            else:
+                decay_group.append(param)
+        return [
+            {"params": decay_group, "weight_decay": self.config.optimizer_weight_decay},
+            {"params": no_decay_group, "weight_decay": 0.0},
+        ]
 
     def reset(self) -> None:
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
@@ -474,10 +725,10 @@ class FlowerPolicy(PreTrainedPolicy):
         action_space_name = self._action_space_from_batch(batch)
         cond = self.model.encode_observations(batch, action_space_name)
         action_dim = self.config.resolve_action_dim(action_space_name)
-        bsz = cond["vlm_features"].shape[0]
+        bsz = cond["features"].shape[0]
         if noise is None:
-            dtype = cond["vlm_features"].dtype
-            device = cond["vlm_features"].device
+            dtype = cond["features"].dtype
+            device = cond["features"].device
             noise = torch.randn(bsz, self.config.chunk_size, action_dim, dtype=dtype, device=device)
         return self.model.sample_actions(noise, cond, action_space_name)
 

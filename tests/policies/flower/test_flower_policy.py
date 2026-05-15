@@ -14,9 +14,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 
 CAMERA_KEYS = (
-    f"{OBS_IMAGES}.left_wrist_cam",
-    f"{OBS_IMAGES}.right_wrist_cam",
-    f"{OBS_IMAGES}.top_view",
+    f"{OBS_IMAGES}.left_left",
+    f"{OBS_IMAGES}.left_top",
+    f"{OBS_IMAGES}.right_right",
 )
 
 
@@ -101,6 +101,7 @@ def make_config(action_dim: int, **overrides) -> FlowerConfig:
         "optimizer_lr": 1e-4,
         "scheduler_warmup_steps": 1,
         "scheduler_decay_steps": 10,
+        "load_pretrained": False,
     }
     kwargs.update(overrides)
     return FlowerConfig(**kwargs)
@@ -150,9 +151,9 @@ def test_flower_task1_default_12d_batch():
 def test_flower_missing_camera_has_clear_error():
     policy = FlowerPolicy(make_config(12))
     batch = make_batch(12)
-    batch.pop(f"{OBS_IMAGES}.right_wrist_cam")
+    batch.pop(f"{OBS_IMAGES}.right_right")
 
-    with pytest.raises(ValueError, match="right_wrist_cam"):
+    with pytest.raises(ValueError, match="right_right"):
         policy.forward(batch)
 
 
